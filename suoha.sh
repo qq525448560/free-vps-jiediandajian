@@ -228,19 +228,19 @@ EOF
   if [ "$protocol" = "1" ]; then
     {
       echo -e "VMess链接（含YouTube和ChatGPT分流）\n"
-      json_tls='{"add":"x.cf.090227.xyz","aid":"0","host":"'"$argo_host"'","id":"'"$uuid"'","net":"ws","path":"'"$urlpath"'","port":"2053","ps":"分流代理_TLS","tls":"tls","type":"none","v":"2"}'
+      json_tls='{"add":"x.cf.090227.xyz","aid":"0","host":"'"$argo_host"'","id":"'"$uuid"'","net":"ws","path":"'"$urlpath"'","port":"2053","ps":"X-分流_TLS","tls":"tls","type":"none","v":"2"}'
       echo "vmess://$(b64enc "$json_tls")"
       echo -e "\nTLS端口: 2053/2083/2087/2096/8443\n"
-      json_nontls='{"add":"x.cf.090227.xyz","aid":"0","host":"'"$argo_host"'","id":"'"$uuid"'","net":"ws","path":"'"$urlpath"'","port":"2052","ps":"分流代理","tls":"","type":"none","v":"2"}'
+      json_nontls='{"add":"x.cf.090227.xyz","aid":"0","host":"'"$argo_host"'","id":"'"$uuid"'","net":"ws","path":"'"$urlpath"'","port":"2052","ps":"X-分流","tls":"","type":"none","v":"2"}'
       echo "vmess://$(b64enc "$json_nontls")"
       echo -e "\n非TLS端口: 2052/2082/2086/2095/8080/8880"
     } > "$SUOHA_DIR/v2ray.txt"
   else
     {
       echo -e "VLESS链接（含YouTube和ChatGPT分流）\n"
-      echo "vless://${uuid}@x.cf.090227.xyz:2053?encryption=none&security=tls&type=ws&host=${argo_host}&path=${urlpath}#分流代理_TLS"
+      echo "vless://${uuid}@x.cf.090227.xyz:2053?encryption=none&security=tls&type=ws&host=${argo_host}&path=${urlpath}#X-分流_TLS"
       echo -e "\nTLS端口: 2053/2083/2087/2096/8443\n"
-      echo "vless://${uuid}@x.cf.090227.xyz:2052?encryption=none&security=none&type=ws&host=${argo_host}&path=${urlpath}#分流代理"
+      echo "vless://${uuid}@x.cf.090227.xyz:2052?encryption=none&security=none&type=ws&host=${argo_host}&path=${urlpath}#X-分流"
       echo -e "\n非TLS端口: 2052/2082/2086/2095/8080/8880"
     } > "$SUOHA_DIR/v2ray.txt"
   fi
