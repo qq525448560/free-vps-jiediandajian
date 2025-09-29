@@ -257,68 +257,98 @@ cleanup() {
   echo "已清理所有文件"
 }
 
-# --- 新增：保活功能 (优化版) ---
+# --- 保活功能 (仅监控重启，不搭建节点) ---
 
-# 保活监控函数 (直接作为函数运行)
+# 保活监控函数 (仅监控已启动的服务，崩溃后重启)
 keepalive_monitor() {
-  local PROTOCOL="$1"
-  local IP_VERSION="$2"
-
   local XRAY_PROC="$SUOHA_DIR/xray/xray"
   local CLOUDFLARED_PROC="$SUOHA_DIR/cloudflared"
   local KEEPALIVE_LOG="$SUOHA_DIR/proxy_keepalive.log"
+  local CONFIG_FILE="$SUOHA_DIR/xray/config.json"
 
+  # 日志输出函数
   log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$KEEPALIVE_LOG"
   }
 
-  log "保活守护进程启动 (PID=$$)"
-  log "配置: 协议=$PROTOCOL, IP版本=$IP_VERSION"
+  # 检查是否存在配置文件（确保服务已通过选项1启动）
+  if [ ! -f "$CONFIG_FILE" ]; then
+    log "错误：未找到代理配置文件，请先通过选项1启动服务"
+    echo "错误：未找到代理配置文件，请先通过选项1启动服务" >&2
+    exit 1
+  fi
 
-  # 首次启动服务
-  log "首次启动代理服务..."
-  _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1 # 首次启动的输出重定向，避免日志混乱
+  # 提取端口配置（从现有配置文件中获取）
+  local port=$(grep -o '"port": [0-9]*' "$CONFIG_FILE" | awk '{print $2}' | tr -d ',')
+  if [ -z "$port" ]; then
+    log "错误：无法从配置文件中获取端口信息"
+    echo "错误：无法从配置文件中获取端口信息" >&2
+    exit 1
+  fi
 
-  # 循环检查
+  # 初始化日志
+  log "保活守护进程启动 (PID=$$) - 仅监控已存在的代理服务"
+  log "监控目标: Xray进程[$XRAY_PROC]、Cloudflared进程[$CLOUDFLARED_PROC]"
+  log "使用现有配置文件: $CONFIG_FILE (端口: $port)"
+
+  # 循环监控逻辑
   while true; do
-    # 检查Xray
+    # 检查Xray进程状态
     if ! pgrep -f "$XRAY_PROC" >/dev/null; then
-      log "Xray进程已退出，重启中..."
-      stop_service > /dev/null 2>&1
-      _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1
+      log "Xray进程已退出，尝试重启..."
+      # 基于已有的配置文件重启Xray（不重新生成配置）
+      if [ -f "$CONFIG_FILE" ]; then
+        "$SUOHA_DIR/xray/xray" run -config "$CONFIG_FILE" >"$SUOHA_DIR/xray.log" 2>&1 &
+        log "Xray已重启"
+      else
+        log "错误：配置文件不存在，无法重启Xray"
+        exit 1
+      fi
     fi
-    # 检查Cloudflared
+
+    # 检查Cloudflared进程状态
     if ! pgrep -f "$CLOUDFLARED_PROC" >/dev/null; then
-      log "Cloudflared进程已退出，重启中..."
-      stop_service > /dev/null 2>&1
-      _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1
+      log "Cloudflared进程已退出，尝试重启..."
+      if [ -x "$CLOUDFLARED_PROC" ]; then
+        "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --protocol http2 > "$SUOHA_DIR/cloudflared.log" 2>&1 &
+        log "Cloudflared已重启"
+      else
+        log "错误：cloudflared可执行文件不存在，无法重启"
+        exit 1
+      fi
     fi
-    sleep 5 # 增加检查间隔，减少CPU占用
+
+    sleep 5  # 每5秒检查一次
   done
 }
 
-# 启动保活服务 (新的菜单选项)
-start_keepalive_service() {
-  read -r -p "选择协议 (1.vmess 2.vless, 默认1): " protocol
-  protocol=${protocol:-1}
-  [ "$protocol" != "1" ] && [ "$protocol" != "2" ] && die "请输入1或2"
-  
-  read -r -p "IP版本 (4/6, 默认4): " ips
-  ips=${ips:-4}
-  [ "$ips" != "4" ] && [ "$ips" != "6" ] && die "请输入4或6"
+# 保活服务管理（仅启动/停止保活进程，不涉及节点搭建）
+manage_keepalive() {
+  # 检查保活进程是否正在运行
+  if pgrep -f "$0 keepalive_monitor" >/dev/null; then
+    # 停止保活进程
+    kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
+    echo "保活服务已停止"
+  else
+    # 检查主服务是否已启动（通过配置文件判断）
+    if [ ! -f "$SUOHA_DIR/xray/config.json" ] || ! pgrep -f "$SUOHA_DIR/xray/xray" >/dev/null; then
+      echo "错误：代理服务未启动，请先通过选项1启动服务" >&2
+      exit 1
+    fi
 
-  # 停止任何现有服务
-  stop_service
-
-  echo "正在启动保活服务..."
-  # 直接在后台启动监控函数，不再创建临时脚本
-  nohup bash -c "$(declare -f log keepalive_monitor _start_service_inner stop_service kill_proc_safe die detect_os); keepalive_monitor '$protocol' '$ips'" > "$SUOHA_DIR/keepalive.log" 2>&1 &
-  
-  # 等待一小会儿，让服务有时间启动
-  sleep 3
-  check_status
-  echo -e "\n保活服务已在后台启动。日志文件: $SUOHA_DIR/keepalive.log"
-  echo "停止保活服务: $0 stop"
+    # 启动保活进程
+    echo "正在启动保活服务..."
+    nohup bash -c "$(declare -f log keepalive_monitor kill_proc_safe); keepalive_monitor" > "$SUOHA_DIR/keepalive.log" 2>&1 &
+    
+    # 等待启动并检查状态
+    sleep 2
+    if pgrep -f "$0 keepalive_monitor" >/dev/null; then
+      echo "保活服务已启动"
+      echo "保活日志: $SUOHA_DIR/proxy_keepalive.log"
+    else
+      echo "保活服务启动失败，请查看日志: $SUOHA_DIR/keepalive.log" >&2
+    fi
+  fi
 }
 
 
@@ -327,7 +357,7 @@ echo "1. 启动服务（含YouTube和ChatGPT分流）"
 echo "2. 停止服务"
 echo "3. 查看状态"
 echo "4. 清理文件"
-echo "5. 启动保活服务（推荐）"
+echo "5. 切换保活服务（仅监控已启动的服务）"
 echo "0. 退出"
 read -r -p "请选择(默认1): " mode
 mode=${mode:-1}
@@ -347,7 +377,7 @@ case "$mode" in
     [ "$confirm" = "y" ] && cleanup || echo "取消清理"
     ;;
   5)
-    start_keepalive_service
+    manage_keepalive
     ;;
   0)
     echo "退出成功"; exit 0;;
