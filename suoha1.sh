@@ -228,11 +228,8 @@ start_service() {
 
 # 停止服务
 stop_service() {
-  # 停止保活守护进程
   kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
-  # 删除保活标志
   rm -f "$KEEPALIVE_FLAG"
-  # 停止主服务进程
   kill_proc_safe "$SUOHA_DIR/cloudflared" "$IS_ALPINE"
   kill_proc_safe "$SUOHA_DIR/xray/xray" "$IS_ALPINE"
   echo "服务和保活进程已停止"
@@ -261,14 +258,11 @@ cleanup() {
 }
 
 # --- 保活功能 (优化版) ---
-
-# 保活监控函数
 keepalive_monitor() {
   local XRAY_PROC="$SUOHA_DIR/xray/xray"
   local CLOUDFLARED_PROC="$SUOHA_DIR/cloudflared"
   local KEEPALIVE_LOG="$SUOHA_DIR/proxy_keepalive.log"
   
-  # 从配置文件获取端口和IP版本
   local port=$(grep -o '"port": [0-9]*' "$SUOHA_DIR/xray/config.json" | awk '{print $2}' | tr -d ',')
   local ips=$(grep -oE 'edge-ip-version "4|6"' "$SUOHA_DIR/argo.log" 2>/dev/null | tail -n1 | awk '{print $2}' || echo "4")
 
@@ -279,80 +273,30 @@ keepalive_monitor() {
   log "保活守护进程启动 (PID=$$)"
   log "开始监控Xray和Cloudflared进程..."
 
-  # 循环检查
   while [ -f "$KEEPALIVE_FLAG" ]; do
-    # 检查Xray
     if ! pgrep -f "$XRAY_PROC" >/dev/null; then
       log "Xray进程已退出，重启中..."
       "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
     fi
-    # 检查Cloudflared
     if ! pgrep -f "$CLOUDFLARED_PROC" >/dev/null; then
       log "Cloudflared进程已退出，重启中..."
       "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
     fi
-    sleep 5  # 每5秒检查一次
+    sleep 5
   done
   
   log "保活守护进程已停止"
 }
 
-# 切换保活功能（启动/关闭）
 toggle_keepalive() {
   if [ -f "$KEEPALIVE_FLAG" ]; then
-    # 停止保活
     rm -f "$KEEPALIVE_FLAG"
     kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
     echo "保活功能已停止"
   else
-    # 检查是否已存在节点文件
     if ! [ -f "$SUOHA_DIR/xray/config.json" ] || ! [ -f "$SUOHA_DIR/xray/xray" ] || ! [ -f "$SUOHA_DIR/cloudflared" ]; then
       echo "未检测到节点文件，请先通过选项1搭建节点"
       return 1
     fi
-    
-    # 启动保活
     touch "$KEEPALIVE_FLAG"
-    echo "正在启动保活功能..."
-    nohup bash -c "$(declare -f log keepalive_monitor kill_proc_safe); keepalive_monitor" > "$SUOHA_DIR/keepalive.log" 2>&1 &
-    
-    # 等待一小会儿，让服务有时间启动
-    sleep 2
-    check_status
-    echo "保活服务已在后台启动。日志文件: $SUOHA_DIR/keepalive.log"
-  fi
-}
-
-
-# --- 主菜单 ---
-echo "1. 启动服务（含YouTube和ChatGPT分流）"
-echo "2. 停止服务"
-echo "3. 查看状态"
-echo "4. 清理文件"
-echo "5. 切换保活功能（启动/关闭）"
-echo "0. 退出"
-read -r -p "请选择(默认1): " mode
-mode=${mode:-1}
-
-case "$mode" in
-  1)
-    start_service
-    ;;
-  2)
-    stop_service
-    ;;
-  3)
-    check_status
-    ;;
-  4)
-    read -r -p "确定清理所有文件? (y/N) " confirm
-    [ "$confirm" = "y" ] && cleanup || echo "取消清理"
-    ;;
-  5)
-    toggle_keepalive
-    ;;
-  0)
-    echo "退出成功"; exit 0;;
-  *)
-    echo "无效选择"; exit 1;;
-esac
+    echo "正在启动
