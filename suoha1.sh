@@ -1,5 +1,5 @@
 #!/bin/bash
-# 无root权限版代理脚本 (修复保活功能版)
+# 无root权限版代理脚本 (保活核心修复版)
 
 set +e
 
@@ -39,9 +39,20 @@ detect_os() {
   esac
 }
 
+# 检查进程是否存在
+proc_exists() {
+  local pat="$1"
+  if [ "$IS_ALPINE" = "1" ]; then
+    [ $(ps | grep -F "$pat" | grep -v grep | wc -l) -gt 0 ]
+  else
+    [ $(ps -ef | grep -F "$pat" | grep -v grep | wc -l) -gt 0 ]
+  fi
+}
+
+# 强制终止进程
 kill_proc_safe() {
-  local pat="$1" is_alpine="$2"
-  if [ "$is_alpine" = "1" ]; then
+  local pat="$1"
+  if [ "$IS_ALPINE" = "1" ]; then
     kill -9 $(ps | grep -F "$pat" | grep -v grep | awk '{print $1}') >/dev/null 2>&1 || true
   else
     kill -9 $(ps -ef | grep -F "$pat" | grep -v grep | awk '{print $2}') >/dev/null 2>&1 || true
@@ -160,18 +171,20 @@ EOF
     die "未知协议"
   fi
 
+  # 启动主服务
   "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
   "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
   sleep 1
 
+  # 等待链接生成
   n=0
   while :; do
     n=$((n+1))
     argo_url="$(grep -oE 'https://[a-zA-Z0-9.-]+trycloudflare\.com' "$SUOHA_DIR/argo.log" 2>/dev/null | tail -n1)"
     if [ $n -ge 30 ]; then
       n=0
-      kill_proc_safe "$SUOHA_DIR/cloudflared" "$IS_ALPINE"
-      kill_proc_safe "$SUOHA_DIR/xray/xray" "$IS_ALPINE"
+      kill_proc_safe "$SUOHA_DIR/cloudflared"
+      kill_proc_safe "$SUOHA_DIR/xray/xray"
       rm -f "$SUOHA_DIR/argo.log"
       "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
       "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
@@ -184,8 +197,8 @@ EOF
     fi
   done
 
+  # 生成链接
   argo_host="${argo_url#https://}"
-
   if [ "$protocol" = "1" ]; then
     {
       echo -e "VMess链接（含YouTube和ChatGPT分流）\n"
@@ -228,24 +241,18 @@ start_service() {
 # 停止服务
 stop_service() {
   # 停止保活守护进程
-  kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
+  kill_proc_safe "$0 keepalive_monitor"
   # 停止主服务进程
-  kill_proc_safe "$SUOHA_DIR/cloudflared" "$IS_ALPINE"
-  kill_proc_safe "$SUOHA_DIR/xray/xray" "$IS_ALPINE"
+  kill_proc_safe "$SUOHA_DIR/cloudflared"
+  kill_proc_safe "$SUOHA_DIR/xray/xray"
   echo "服务和保活进程已停止"
 }
 
 # 查看状态
 check_status() {
-  if [ "$IS_ALPINE" = "1" ]; then
-    [ $(ps | grep -F "$SUOHA_DIR/cloudflared" | grep -v grep | wc -l) -gt 0 ] && echo "cloudflared: 运行中" || echo "cloudflared: 已停止"
-    [ $(ps | grep -F "$SUOHA_DIR/xray/xray" | grep -v grep | wc -l) -gt 0 ] && echo "xray: 运行中" || echo "xray: 已停止"
-    [ $(ps | grep -F "$0 keepalive_monitor" | grep -v grep | wc -l) -gt 0 ] && echo "保活守护: 运行中" || echo "保活守护: 已停止"
-  else
-    [ $(ps -ef | grep -F "$SUOHA_DIR/cloudflared" | grep -v grep | wc -l) -gt 0 ] && echo "cloudflared: 运行中" || echo "cloudflared: 已停止"
-    [ $(ps -ef | grep -F "$SUOHA_DIR/xray/xray" | grep -v grep | wc -l) -gt 0 ] && echo "xray: 运行中" || echo "xray: 已停止"
-    [ $(ps -ef | grep -F "$0 keepalive_monitor" | grep -v grep | wc -l) -gt 0 ] && echo "保活守护: 运行中" || echo "保活守护: 已停止"
-  fi
+  proc_exists "$SUOHA_DIR/cloudflared" && echo "cloudflared: 运行中" || echo "cloudflared: 已停止"
+  proc_exists "$SUOHA_DIR/xray/xray" && echo "xray: 运行中" || echo "xray: 已停止"
+  proc_exists "$0 keepalive_monitor" && echo "保活守护: 运行中" || echo "保活守护: 已停止"
   
   [ -f "$SUOHA_DIR/v2ray.txt" ] && echo -e "\n当前链接:\n$(cat "$SUOHA_DIR/v2ray.txt")" || echo -e "\n未找到链接"
 }
@@ -257,105 +264,102 @@ cleanup() {
   echo "已清理所有文件"
 }
 
-# --- 保活功能 (修复版) ---
+# --- 保活核心功能（精准监控并重启进程） ---
 
-# 保活监控函数
+# 保活监控主函数
 keepalive_monitor() {
-  # 显式定义目录，确保路径正确
   local SUOHA_DIR="$HOME/.suoha"
-  local XRAY_PROC="$SUOHA_DIR/xray/xray"
-  local CLOUDFLARED_PROC="$SUOHA_DIR/cloudflared"
+  local XRAY_BIN="$SUOHA_DIR/xray/xray"
+  local XRAY_CONFIG="$SUOHA_DIR/xray/config.json"
+  local CLOUDFLARED_BIN="$SUOHA_DIR/cloudflared"
   local KEEPALIVE_LOG="$SUOHA_DIR/proxy_keepalive.log"
-  local CONFIG_FILE="$SUOHA_DIR/xray/config.json"
-  local CLOUDFLARED_LOG="$SUOHA_DIR/cloudflared.log"
-
+  
   # 日志函数
   log() {
-    # 确保日志文件存在
     touch "$KEEPALIVE_LOG"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$KEEPALIVE_LOG"
   }
-
-  # 检查配置文件是否存在
-  if [ ! -f "$CONFIG_FILE" ]; then
-    log "错误：未找到配置文件，请先通过选项1启动服务"
-    echo "错误：未找到配置文件，请先通过选项1启动服务" >&2
+  
+  # 前置检查：确保主服务文件存在
+  if [ ! -f "$XRAY_BIN" ] || [ ! -f "$XRAY_CONFIG" ] || [ ! -x "$CLOUDFLARED_BIN" ]; then
+    log "错误：主服务文件不完整，请先通过选项1启动服务"
+    echo "错误：主服务文件不完整，请先通过选项1启动服务" >&2
     exit 1
   fi
-
-  # 从配置文件获取端口
-  local port=$(grep -o '"port": [0-9]*' "$CONFIG_FILE" | awk '{print $2}' | tr -d ',')
-  if [ -z "$port" ]; then
-    log "错误：无法从配置文件获取端口信息"
-    echo "错误：无法从配置文件获取端口信息" >&2
+  
+  # 从配置文件提取端口（只取inbounds中的端口）
+  local port=$(grep -A 5 '"inbounds":' "$XRAY_CONFIG" | grep -o '"port": [0-9]*' | head -n1 | awk '{print $2}' | tr -d ',')
+  if [ -z "$port" ] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    log "错误：无法获取有效端口，保活启动失败"
+    echo "错误：无法获取有效端口，保活启动失败" >&2
     exit 1
   fi
-
-  # 初始化日志
-  log "保活服务启动 (PID=$$)"
-  log "监控对象：Xray和Cloudflared进程"
+  
+  # 启动日志
+  log "保活服务启动成功 (PID=$$)"
+  log "监控目标：Xray进程和Cloudflared进程"
   log "使用端口：$port"
-
-  # 监控循环
+  log "保活逻辑：任何一个进程停止则立即重启"
+  
+  # 核心监控循环（每3秒检查一次）
   while true; do
-    # 检查Xray
-    if ! pgrep -f "$XRAY_PROC" >/dev/null; then
-      log "Xray已停止，尝试重启..."
-      if [ -f "$CONFIG_FILE" ]; then
-        "$SUOHA_DIR/xray/xray" run -config "$CONFIG_FILE" >"$SUOHA_DIR/xray.log" 2>&1 &
+    # 检查Xray进程
+    if ! proc_exists "$XRAY_BIN"; then
+      log "Xray进程已停止，正在重启..."
+      # 强制清理残留进程并重启
+      kill_proc_safe "$XRAY_BIN"
+      "$XRAY_BIN" run -config "$XRAY_CONFIG" >"$SUOHA_DIR/xray.log" 2>&1 &
+      sleep 1
+      if proc_exists "$XRAY_BIN"; then
         log "Xray重启成功"
       else
-        log "配置文件丢失，无法重启Xray"
-        exit 1
+        log "警告：Xray重启失败，将在3秒后重试"
       fi
     fi
-
-    # 检查Cloudflared
-    if ! pgrep -f "$CLOUDFLARED_PROC" >/dev/null; then
-      log "Cloudflared已停止，尝试重启..."
-      if [ -x "$CLOUDFLARED_PROC" ]; then
-        "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --protocol http2 > "$CLOUDFLARED_LOG" 2>&1 &
+    
+    # 检查Cloudflared进程
+    if ! proc_exists "$CLOUDFLARED_BIN"; then
+      log "Cloudflared进程已停止，正在重启..."
+      # 强制清理残留进程并重启
+      kill_proc_safe "$CLOUDFLARED_BIN"
+      "$CLOUDFLARED_BIN" tunnel --url "http://localhost:$port" --no-autoupdate --protocol http2 > "$SUOHA_DIR/cloudflared.log" 2>&1 &
+      sleep 1
+      if proc_exists "$CLOUDFLARED_BIN"; then
         log "Cloudflared重启成功"
       else
-        log "Cloudflared文件丢失，无法重启"
-        exit 1
+        log "警告：Cloudflared重启失败，将在3秒后重试"
       fi
     fi
-
-    sleep 5
+    
+    sleep 3  # 3秒检查一次，快速响应进程异常
   done
 }
 
-# 保活服务管理
+# 保活服务管理（启动/停止切换）
 manage_keepalive() {
   local SUOHA_DIR="$HOME/.suoha"
   
-  # 检查保活进程是否运行
-  if pgrep -f "$0 keepalive_monitor" >/dev/null; then
-    # 停止保活
-    kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
+  # 检查保活进程是否已运行
+  if proc_exists "$0 keepalive_monitor"; then
+    # 停止保活服务
+    kill_proc_safe "$0 keepalive_monitor"
     echo "保活服务已停止"
   else
     # 检查主服务是否已启动
-    if [ ! -f "$SUOHA_DIR/xray/config.json" ] || ! pgrep -f "$SUOHA_DIR/xray/xray" >/dev/null; then
-      echo "错误：请先通过选项1启动代理服务" >&2
+    if ! proc_exists "$SUOHA_DIR/xray/xray" || ! proc_exists "$SUOHA_DIR/cloudflared"; then
+      echo "错误：请先通过选项1启动代理服务（确保Xray和Cloudflared都运行）" >&2
       exit 1
     fi
-
-    # 启动保活
-    echo "正在启动保活服务..."
-    nohup bash -c "
-      $(declare -f kill_proc_safe)
-      $(declare -f log)
-      $(declare -f keepalive_monitor)
-      keepalive_monitor
-    " > "$SUOHA_DIR/keepalive.log" 2>&1 &
     
-    # 检查启动结果
+    # 启动保活服务（兼容所有系统的简单方式）
+    echo "正在启动保活服务..."
+    nohup bash -c "$0 keepalive_monitor" > "$SUOHA_DIR/keepalive.log" 2>&1 &
+    
+    # 等待启动并验证
     sleep 2
-    if pgrep -f "$0 keepalive_monitor" >/dev/null; then
+    if proc_exists "$0 keepalive_monitor"; then
       echo "保活服务已成功启动"
-      echo "保活日志位置：$SUOHA_DIR/proxy_keepalive.log"
+      echo "保活日志：$SUOHA_DIR/proxy_keepalive.log（可查看监控和重启记录）"
     else
       echo "保活服务启动失败，请查看日志：$SUOHA_DIR/keepalive.log" >&2
     fi
@@ -368,7 +372,7 @@ echo "1. 启动服务（含YouTube和ChatGPT分流）"
 echo "2. 停止服务"
 echo "3. 查看状态"
 echo "4. 清理文件"
-echo "5. 切换保活服务（仅监控已启动的服务）"
+echo "5. 切换保活服务（监控并重启Xray和Cloudflared）"
 echo "0. 退出"
 read -r -p "请选择(默认1): " mode
 mode=${mode:-1}
