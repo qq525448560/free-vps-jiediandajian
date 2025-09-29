@@ -1,5 +1,5 @@
 #!/bin/bash
-# 无root权限版代理脚本 (已集成保活功能)
+# 无root权限版代理脚本 (已集成保活功能 - 优化版)
 
 set +e
 
@@ -70,15 +70,13 @@ need_cmd nohup  # 保活功能需要
 
 # --- 核心功能函数 ---
 
-# 启动服务 (内部函数，被 start_service 和 keepalive_monitor 调用)
+# 启动服务 (内部函数)
 _start_service_inner() {
   local protocol="$1"
   local ips="$2"
 
-  # 清理旧文件
   rm -rf "$SUOHA_DIR/xray" "$SUOHA_DIR/cloudflared" "$SUOHA_DIR/xray.zip" "$SUOHA_DIR/argo.log"
 
-  # 下载对应架构的程序
   arch="$(uname -m)"
   case "$arch" in
     x86_64|x64|amd64 )
@@ -101,25 +99,20 @@ _start_service_inner() {
       echo "不支持的架构: $(uname -m)"; exit 1;;
   esac
 
-  # 解压并授权
   mkdir -p "$SUOHA_DIR/xray"
   unzip -q -d "$SUOHA_DIR/xray" "$SUOHA_DIR/xray.zip" || die "解压Xray失败"
   chmod +x "$SUOHA_DIR/cloudflared" "$SUOHA_DIR/xray/xray"
   rm -f "$SUOHA_DIR/xray.zip"
 
-  # 生成随机配置
   uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "uuid-$(date +%s)")"
   urlpath="$(echo "$uuid" | awk -F- '{print $1}')"
-  port=$((RANDOM % 10000 + 20000))  # 非root端口
+  port=$((RANDOM % 10000 + 20000))
 
-  # 生成Xray配置
   if [ "$protocol" = "1" ]; then
 cat > "$SUOHA_DIR/xray/config.json" <<EOF
 {
   "inbounds": [{
-    "port": $port,
-    "listen": "localhost",
-    "protocol": "vmess",
+    "port": $port, "listen": "localhost", "protocol": "vmess",
     "settings": { "clients": [{ "id": "$uuid", "alterId": 0 }] },
     "streamSettings": { "network": "ws", "wsSettings": { "path": "$urlpath" } }
   }],
@@ -143,9 +136,7 @@ EOF
 cat > "$SUOHA_DIR/xray/config.json" <<EOF
 {
   "inbounds": [{
-    "port": $port,
-    "listen": "localhost",
-    "protocol": "vless",
+    "port": $port, "listen": "localhost", "protocol": "vless",
     "settings": { "decryption": "none", "clients": [{ "id": "$uuid" }] },
     "streamSettings": { "network": "ws", "wsSettings": { "path": "$urlpath" } }
   }],
@@ -166,28 +157,22 @@ cat > "$SUOHA_DIR/xray/config.json" <<EOF
 }
 EOF
   else
-    die "未知协议（请输入1或2）"
+    die "未知协议"
   fi
 
-  # 启动服务
   "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
   "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
   sleep 1
 
-  # 获取Argo地址
   n=0
   while :; do
     n=$((n+1))
-    clear
-    echo "等待Cloudflare Argo生成地址（$n秒）"
-    argo_url="$(grep -oE 'https://[a-zA-Z0-9.-]+trycloudflare\.com' "$SUOHA_DIR/argo.log" | tail -n1)"
-
+    argo_url="$(grep -oE 'https://[a-zA-Z0-9.-]+trycloudflare\.com' "$SUOHA_DIR/argo.log" 2>/dev/null | tail -n1)"
     if [ $n -ge 30 ]; then
       n=0
       kill_proc_safe "$SUOHA_DIR/cloudflared" "$IS_ALPINE"
       kill_proc_safe "$SUOHA_DIR/xray/xray" "$IS_ALPINE"
       rm -f "$SUOHA_DIR/argo.log"
-      echo "超时，重试中..."
       "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
       "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
       sleep 1
@@ -199,10 +184,8 @@ EOF
     fi
   done
 
-  clear
   argo_host="${argo_url#https://}"
 
-  # 生成代理链接
   if [ "$protocol" = "1" ]; then
     {
       echo -e "VMess链接（含YouTube和ChatGPT分流）\n"
@@ -225,10 +208,9 @@ EOF
 
   cat "$SUOHA_DIR/v2ray.txt"
   echo -e "\n链接已保存至 $SUOHA_DIR/v2ray.txt"
-  echo "停止服务: $0 stop"
 }
 
-# 启动服务 (原功能，保持不变)
+# 启动服务 (原功能)
 start_service() {
   read -r -p "选择协议 (1.vmess 2.vless, 默认1): " protocol
   protocol=${protocol:-1}
@@ -237,55 +219,50 @@ start_service() {
   read -r -p "IP版本 (4/6, 默认4): " ips
   ips=${ips:-4}
   [ "$ips" != "4" ] && [ "$ips" != "6" ] && die "请输入4或6"
-  
-  isp="$(curl -s -"${ips}" https://speed.cloudflare.com/meta 2>/dev/null | awk -F\" '{print $26"-"$18"-"$30}' | sed 's/ /_/g')"
-  [ -z "$isp" ] && isp="unknown-$(date +%s)"
 
   stop_service
   _start_service_inner "$protocol" "$ips"
+  echo "停止服务: $0 stop"
 }
 
-# 停止服务 (原功能，现在也会停止保活进程)
+# 停止服务
 stop_service() {
-  # 停止保活守护进程
-  kill_proc_safe "$SUOHA_DIR/keepalive_monitor.sh" "$IS_ALPINE"
+  # 停止保活守护进程 (通过grep脚本名和关键字'keepalive_monitor'来精确定位)
+  kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
   # 停止主服务进程
   kill_proc_safe "$SUOHA_DIR/cloudflared" "$IS_ALPINE"
   kill_proc_safe "$SUOHA_DIR/xray/xray" "$IS_ALPINE"
   echo "服务和保活进程已停止"
 }
 
-# 查看状态 (原功能)
+# 查看状态
 check_status() {
   if [ "$IS_ALPINE" = "1" ]; then
     [ $(ps | grep -F "$SUOHA_DIR/cloudflared" | grep -v grep | wc -l) -gt 0 ] && echo "cloudflared: 运行中" || echo "cloudflared: 已停止"
     [ $(ps | grep -F "$SUOHA_DIR/xray/xray" | grep -v grep | wc -l) -gt 0 ] && echo "xray: 运行中" || echo "xray: 已停止"
-    [ $(ps | grep -F "$SUOHA_DIR/keepalive_monitor.sh" | grep -v grep | wc -l) -gt 0 ] && echo "保活守护: 运行中" || echo "保活守护: 已停止"
+    [ $(ps | grep -F "$0 keepalive_monitor" | grep -v grep | wc -l) -gt 0 ] && echo "保活守护: 运行中" || echo "保活守护: 已停止"
   else
     [ $(ps -ef | grep -F "$SUOHA_DIR/cloudflared" | grep -v grep | wc -l) -gt 0 ] && echo "cloudflared: 运行中" || echo "cloudflared: 已停止"
     [ $(ps -ef | grep -F "$SUOHA_DIR/xray/xray" | grep -v grep | wc -l) -gt 0 ] && echo "xray: 运行中" || echo "xray: 已停止"
-    [ $(ps -ef | grep -F "$SUOHA_DIR/keepalive_monitor.sh" | grep -v grep | wc -l) -gt 0 ] && echo "保活守护: 运行中" || echo "保活守护: 已停止"
+    [ $(ps -ef | grep -F "$0 keepalive_monitor" | grep -v grep | wc -l) -gt 0 ] && echo "保活守护: 运行中" || echo "保活守护: 已停止"
   fi
   
   [ -f "$SUOHA_DIR/v2ray.txt" ] && echo -e "\n当前链接:\n$(cat "$SUOHA_DIR/v2ray.txt")" || echo -e "\n未找到链接"
 }
 
-# 清理文件 (原功能)
+# 清理文件
 cleanup() {
   stop_service
   rm -rf "$SUOHA_DIR"
   echo "已清理所有文件"
 }
 
-# --- 新增：保活功能 ---
+# --- 新增：保活功能 (优化版) ---
 
-# 保活监控函数 (这是一个独立的函数，会被写入到一个临时脚本中后台运行)
+# 保活监控函数 (直接作为函数运行)
 keepalive_monitor() {
-  local PROXY_SCRIPT="$1"
-  local PROTOCOL="$2"
-  local IP_VERSION="$3"
-  local SUOHA_DIR="$4"
-  local IS_ALPINE="$5"
+  local PROTOCOL="$1"
+  local IP_VERSION="$2"
 
   local XRAY_PROC="$SUOHA_DIR/xray/xray"
   local CLOUDFLARED_PROC="$SUOHA_DIR/cloudflared"
@@ -300,23 +277,23 @@ keepalive_monitor() {
 
   # 首次启动服务
   log "首次启动代理服务..."
-  bash "$PROXY_SCRIPT" start_service_inner "$PROTOCOL" "$IP_VERSION"
+  _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1 # 首次启动的输出重定向，避免日志混乱
 
   # 循环检查
   while true; do
     # 检查Xray
     if ! pgrep -f "$XRAY_PROC" >/dev/null; then
       log "Xray进程已退出，重启中..."
-      bash "$PROXY_SCRIPT" stop_service
-      bash "$PROXY_SCRIPT" start_service_inner "$PROTOCOL" "$IP_VERSION"
+      stop_service > /dev/null 2>&1
+      _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1
     fi
     # 检查Cloudflared
     if ! pgrep -f "$CLOUDFLARED_PROC" >/dev/null; then
       log "Cloudflared进程已退出，重启中..."
-      bash "$PROXY_SCRIPT" stop_service
-      bash "$PROXY_SCRIPT" start_service_inner "$PROTOCOL" "$IP_VERSION"
+      stop_service > /dev/null 2>&1
+      _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1
     fi
-    sleep 3
+    sleep 5 # 增加检查间隔，减少CPU占用
   done
 }
 
@@ -333,26 +310,12 @@ start_keepalive_service() {
   # 停止任何现有服务
   stop_service
 
-  # 创建一个临时的监控脚本并后台运行它
-  # 这样做是为了让nohup能正确执行一个复杂的函数
-  MONITOR_SCRIPT="$SUOHA_DIR/keepalive_monitor.sh"
-  cat > "$MONITOR_SCRIPT" <<EOF
-#!/bin/bash
-$(declare -f keepalive_monitor)
-$(declare -f stop_service)
-$(declare -f _start_service_inner)
-$(declare -f kill_proc_safe)
-$(declare -f die)
-keepalive_monitor "$0" "$protocol" "$ips" "$SUOHA_DIR" "$IS_ALPINE"
-EOF
-  chmod +x "$MONITOR_SCRIPT"
-
-  # 使用nohup后台启动监控脚本
   echo "正在启动保活服务..."
-  nohup "$MONITOR_SCRIPT" > "$SUOHA_DIR/keepalive.log" 2>&1 &
+  # 直接在后台启动监控函数，不再创建临时脚本
+  nohup bash -c "$(declare -f log keepalive_monitor _start_service_inner stop_service kill_proc_safe die detect_os); keepalive_monitor '$protocol' '$ips'" > "$SUOHA_DIR/keepalive.log" 2>&1 &
   
   # 等待一小会儿，让服务有时间启动
-  sleep 2
+  sleep 3
   check_status
   echo -e "\n保活服务已在后台启动。日志文件: $SUOHA_DIR/keepalive.log"
   echo "停止保活服务: $0 stop"
