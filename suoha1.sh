@@ -1,5 +1,5 @@
 #!/bin/bash
-# 无root权限版代理脚本 (已集成保活功能)
+# 无root权限版代理脚本
 
 set +e
 
@@ -42,9 +42,11 @@ detect_os() {
 kill_proc_safe() {
   local pat="$1" is_alpine="$2"
   if [ "$is_alpine" = "1" ]; then
-    kill -9 $(ps | grep -F "$pat" | grep -v grep | awk '{print $1}') >/dev/null 2>&1
+    pids=$(ps | grep -F "$pat" | grep -v grep | awk '{print $1}' 2>/dev/null)
+    [ -n "$pids" ] && kill -9 $pids >/dev/null 2>&1
   else
-    kill -9 $(ps -ef | grep -F "$pat" | grep -v grep | awk '{print $2}') >/dev/null 2>&1
+    pids=$(ps -ef | grep -F "$pat" | grep -v grep | awk '{print $2}' 2>/dev/null)
+    [ -n "$pids" ] && kill -9 $pids >/dev/null 2>&1
   fi
 }
 
@@ -106,7 +108,7 @@ start_service() {
   urlpath="$(echo "$uuid" | awk -F- '{print $1}')"
   port=$((RANDOM % 10000 + 20000))  # 非root端口
 
-  # 生成Xray配置（修复语法错误：确保EOF单独成行且无缩进）
+  # 生成Xray配置
   if [ "$protocol" = "1" ]; then
 cat > "$SUOHA_DIR/xray/config.json" <<EOF
 {
@@ -254,8 +256,6 @@ EOF
 stop_service() {
   kill_proc_safe "$SUOHA_DIR/cloudflared" "$IS_ALPINE"
   kill_proc_safe "$SUOHA_DIR/xray/xray" "$IS_ALPINE"
-  # 同时停止保活监控进程
-  kill_proc_safe "$$" "$IS_ALPINE" 2>/dev/null || true
   echo "服务已停止"
 }
 
@@ -296,32 +296,26 @@ keepalive_service() {
     
     # 如果Xray不在运行，重启它
     if [ $xray_running -eq 0 ]; then
-      echo "$(date): Xray进程停止，正在重启..." >> "$SUOHA_DIR/keepalive.log"
+      echo "$(date): Xray进程停止，正在重启..." >> "$SUOHA_DIR/keepalive.log" 2>/dev/null
       if [ -f "$SUOHA_DIR/xray/xray" ] && [ -f "$SUOHA_DIR/xray/config.json" ]; then
         "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
-        echo "$(date): Xray重启完成" >> "$SUOHA_DIR/keepalive.log"
+        echo "$(date): Xray重启完成" >> "$SUOHA_DIR/keepalive.log" 2>/dev/null
       else
-        echo "$(date): 错误: 找不到Xray可执行文件或配置文件" >> "$SUOHA_DIR/keepalive.log"
+        echo "$(date): 错误: 找不到Xray可执行文件或配置文件" >> "$SUOHA_DIR/keepalive.log" 2>/dev/null
       fi
     fi
     
     # 如果Cloudflared不在运行，重启它
     if [ $cloudflared_running -eq 0 ]; then
-      echo "$(date): Cloudflared进程停止，正在重启..." >> "$SUOHA_DIR/keepalive.log"
+      echo "$(date): Cloudflared进程停止，正在重启..." >> "$SUOHA_DIR/keepalive.log" 2>/dev/null
       if [ -f "$SUOHA_DIR/cloudflared" ] && [ -f "$SUOHA_DIR/xray/config.json" ]; then
         # 从配置文件中获取端口
         port=$(grep '"port":' "$SUOHA_DIR/xray/config.json" | awk '{print $2}' | tr -d ',')
-        # 使用之前选择的IP版本
         "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
-        echo "$(date): Cloudflared重启完成" >> "$SUOHA_DIR/keepalive.log"
+        echo "$(date): Cloudflared重启完成" >> "$SUOHA_DIR/keepalive.log" 2>/dev/null
       else
-        echo "$(date): 错误: 找不到Cloudflared可执行文件或配置文件" >> "$SUOHA_DIR/keepalive.log"
+        echo "$(date): 错误: 找不到Cloudflared可执行文件或配置文件" >> "$SUOHA_DIR/keepalive.log" 2>/dev/null
       fi
-    fi
-    
-    # 如果两个进程都在运行，记录一次心跳
-    if [ $xray_running -gt 0 ] && [ $cloudflared_running -gt 0 ]; then
-      echo "$(date): 心跳检测 - 所有服务运行正常" >> "$SUOHA_DIR/keepalive.log" 2>/dev/null
     fi
     
     # 等待5秒后再次检查
