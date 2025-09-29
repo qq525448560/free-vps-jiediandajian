@@ -1,387 +1,175 @@
 #!/bin/bash
-# 适配Alpine系统的代理脚本（保活核心修复）
+# 轻量化代理脚本（减少内存占用，适配低资源环境）
 
-set +e
+set -e
 
-# --- 基础工具函数 ---
-b64enc() {
-  if base64 --help 2>/dev/null | grep -q '\-w'; then
-    printf '%s' "$1" | base64 -w 0
-  else
-    printf '%s' "$1" | base64 | tr -d '\n'
-  fi
-}
-
+# 基础工具检查
 need_cmd() { 
   if ! command -v "$1" >/dev/null 2>&1; then
-    echo "错误: 需要 $1 命令，请先安装：apk add $1" >&2
+    echo "错误: 缺少依赖 $1，请安装：apk add $1" >&2
     exit 1
   fi
 }
 
-die() { echo "ERROR: $*" >&2; exit 1; }
-
-detect_os() {
-  if [ -r /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="${ID:-}"
-  else
-    OS_ID=""
-  fi
-
-  case "$OS_ID" in
-    alpine)
-      IS_ALPINE=1
-      ;;
-    *)
-      IS_ALPINE=0
-      ;;
-  esac
-}
-
-# 【Alpine兼容】检查进程是否存在（精准匹配完整路径）
-proc_exists() {
-  local proc_path="$1"
-  # 适配Alpine的ps格式（PID在第1列，命令在第5列及以后）
-  if [ "$IS_ALPINE" = "1" ]; then
-    # 用完整路径匹配进程，避免误判
-    [ $(ps | grep -F "$proc_path" | grep -v grep | wc -l) -gt 0 ]
-  else
-    [ $(ps -ef | grep -F "$proc_path" | grep -v grep | wc -l) -gt 0 ]
-  fi
-}
-
-# 【Alpine兼容】强制终止进程（通过完整路径）
-kill_proc_safe() {
-  local proc_path="$1"
-  if [ "$IS_ALPINE" = "1" ]; then
-    # Alpine的ps输出中PID在第1列
-    kill -9 $(ps | grep -F "$proc_path" | grep -v grep | awk '{print $1}') >/dev/null 2>&1 || true
-  else
-    kill -9 $(ps -ef | grep -F "$proc_path" | grep -v grep | awk '{print $2}') >/dev/null 2>&1 || true
-  fi
-}
-
-# --- 分流配置 ---
-PROXY_OUT_IP="172.233.171.224"
-PROXY_OUT_PORT=16416
-PROXY_OUT_ID="8c1b9bea-cb51-43bb-a65c-0af31bbbf145"
-
-# --- 用户目录 ---
-SUOHA_DIR="$HOME/.suoha"
-mkdir -p "$SUOHA_DIR" || die "无法创建目录 $SUOHA_DIR（请检查权限）"
-
-# --- 初始化 ---
-detect_os
 need_cmd curl
 need_cmd unzip
 need_cmd awk
 need_cmd grep
-need_cmd tr
-need_cmd ps
-need_cmd kill
-need_cmd nohup
 
-# --- 核心功能函数 ---
+# 配置参数（精简）
+SUOHA_DIR="$HOME/.suoha"
+mkdir -p "$SUOHA_DIR" || { echo "无法创建目录 $SUOHA_DIR"; exit 1; }
 
-# 启动服务 (内部函数)
-_start_service_inner() {
-  local protocol="$1"
-  local ips="$2"
+# 清理旧进程和文件（释放资源）
+cleanup_old() {
+  pkill -f "$SUOHA_DIR/xray/xray" >/dev/null 2>&1 || true
+  pkill -f "$SUOHA_DIR/cloudflared" >/dev/null 2>&1 || true
+  rm -rf "$SUOHA_DIR/xray" "$SUOHA_DIR/cloudflared" "$SUOHA_DIR/*.log"
+}
 
-  rm -rf "$SUOHA_DIR/xray" "$SUOHA_DIR/cloudflared" "$SUOHA_DIR/xray.zip" "$SUOHA_DIR/argo.log"
+# 搭建节点（轻量化配置）
+setup_node() {
+  # 选择协议和IP版本
+  read -r -p "选择协议 (1.vmess 2.vless, 默认1): " protocol
+  protocol=${protocol:-1}
+  [ "$protocol" != "1" ] && [ "$protocol" != "2" ] && { echo "请输入1或2"; exit 1; }
+  
+  read -r -p "IP版本 (4/6, 默认4): " ips
+  ips=${ips:-4}
+  [ "$ips" != "4" ] && [ "$ips" != "6" ] && { echo "请输入4或6"; exit 1; }
 
+  # 清理旧资源（关键：释放内存）
+  cleanup_old
+  
+  # 下载核心程序（使用稳定版本）
+  echo "正在下载核心程序（轻量化版本）..."
   arch="$(uname -m)"
   case "$arch" in
-    x86_64|x64|amd64 )
-      curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o "$SUOHA_DIR/xray.zip" || die "下载Xray失败"
-      curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o "$SUOHA_DIR/cloudflared" || die "下载cloudflared失败"
-      ;;
-    i386|i686 )
-      curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-32.zip -o "$SUOHA_DIR/xray.zip" || die "下载Xray失败"
-      curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386 -o "$SUOHA_DIR/cloudflared" || die "下载cloudflared失败"
-      ;;
-    armv8|arm64|aarch64 )
-      curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip -o "$SUOHA_DIR/xray.zip" || die "下载Xray失败"
-      curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -o "$SUOHA_DIR/cloudflared" || die "下载cloudflared失败"
-      ;;
-    armv7l )
-      curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm32-v7a.zip -o "$SUOHA_DIR/xray.zip" || die "下载Xray失败"
-      curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm -o "$SUOHA_DIR/cloudflared" || die "下载cloudflared失败"
+    x86_64|amd64 )
+      xray_url="https://github.com/XTLS/Xray-core/releases/download/v1.8.13/Xray-linux-64.zip"  # 较旧版本，内存占用更低
+      cloudflared_url="https://github.com/cloudflare/cloudflared/releases/download/2024.5.1/cloudflared-linux-amd64"
       ;;
     * )
-      echo "不支持的架构: $(uname -m)"; exit 1;;
+      xray_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"  # 其他架构用最新版
+      cloudflared_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+      ;;
   esac
 
+  # 下载并解压（增加超时控制）
+  curl -fsSL --connect-timeout 10 "$xray_url" -o "$SUOHA_DIR/xray.zip" || { echo "Xray下载失败"; exit 1; }
   mkdir -p "$SUOHA_DIR/xray"
-  unzip -q -d "$SUOHA_DIR/xray" "$SUOHA_DIR/xray.zip" || die "解压Xray失败"
-  chmod +x "$SUOHA_DIR/cloudflared" "$SUOHA_DIR/xray/xray"
+  unzip -q -d "$SUOHA_DIR/xray" "$SUOHA_DIR/xray.zip" || { echo "Xray解压失败"; exit 1; }
+  chmod +x "$SUOHA_DIR/xray/xray"
   rm -f "$SUOHA_DIR/xray.zip"
 
+  curl -fsSL --connect-timeout 10 "$cloudflared_url" -o "$SUOHA_DIR/cloudflared" || { echo "Cloudflared下载失败"; exit 1; }
+  chmod +x "$SUOHA_DIR/cloudflared"
+
+  # 生成配置（简化路由，减少内存占用）
   uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "uuid-$(date +%s)")"
   urlpath="$(echo "$uuid" | awk -F- '{print $1}')"
   port=$((RANDOM % 10000 + 20000))
 
+  echo "正在生成精简配置文件..."
   if [ "$protocol" = "1" ]; then
-cat > "$SUOHA_DIR/xray/config.json" <<EOF
+    cat > "$SUOHA_DIR/xray/config.json" <<EOF
 {
+  "log": { "loglevel": "error" },  # 只记录错误日志，减少IO和内存
   "inbounds": [{
-    "port": $port, "listen": "localhost", "protocol": "vmess",
+    "port": $port, "listen": "127.0.0.1", "protocol": "vmess",
     "settings": { "clients": [{ "id": "$uuid", "alterId": 0 }] },
-    "streamSettings": { "network": "ws", "wsSettings": { "path": "$urlpath" } }
+    "streamSettings": { "network": "ws", "wsSettings": { "path": "/$urlpath" } }
   }],
-  "outbounds": [
-    { "protocol": "freedom", "settings": {}, "tag": "direct" },
-    { "protocol": "vmess", "tag": "proxy",
-      "settings": { "vnext": [{ "address": "$PROXY_OUT_IP", "port": $PROXY_OUT_PORT,
-        "users": [{ "id": "$PROXY_OUT_ID", "alterId": 0 }] }] } },
-    { "protocol": "blackhole", "tag": "block", "settings": {} }
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      { "type": "field", "domain": ["youtube.com","googlevideo.com","ytimg.com","gstatic.com","googleapis.com","ggpht.com","googleusercontent.com"], "outboundTag": "proxy" },
-      { "type": "field", "domain": ["openai.com","chat.openai.com","api.openai.com","auth0.openai.com","cdn.openai.com","oaiusercontent.com"], "outboundTag": "proxy" }
-    ]
-  }
-}
-EOF
-  elif [ "$protocol" = "2" ]; then
-cat > "$SUOHA_DIR/xray/config.json" <<EOF
-{
-  "inbounds": [{
-    "port": $port, "listen": "localhost", "protocol": "vless",
-    "settings": { "decryption": "none", "clients": [{ "id": "$uuid" }] },
-    "streamSettings": { "network": "ws", "wsSettings": { "path": "$urlpath" } }
-  }],
-  "outbounds": [
-    { "protocol": "freedom", "settings": {}, "tag": "direct" },
-    { "protocol": "vmess", "tag": "proxy",
-      "settings": { "vnext": [{ "address": "$PROXY_OUT_IP", "port": $PROXY_OUT_PORT,
-        "users": [{ "id": "$PROXY_OUT_ID", "alterId": 0 }] }] } },
-    { "protocol": "blackhole", "tag": "block", "settings": {} }
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      { "type": "field", "domain": ["youtube.com","googlevideo.com","ytimg.com","gstatic.com","googleapis.com","ggpht.com","googleusercontent.com"], "outboundTag": "proxy" },
-      { "type": "field", "domain": ["openai.com","chat.openai.com","api.openai.com","auth0.openai.com","cdn.openai.com","oaiusercontent.com"], "outboundTag": "proxy" }
-    ]
-  }
+  "outbounds": [{ "protocol": "freedom", "settings": {} }]
 }
 EOF
   else
-    die "未知协议"
+    cat > "$SUOHA_DIR/xray/config.json" <<EOF
+{
+  "log": { "loglevel": "error" },  # 只记录错误日志
+  "inbounds": [{
+    "port": $port, "listen": "127.0.0.1", "protocol": "vless",
+    "settings": { "decryption": "none", "clients": [{ "id": "$uuid" }] },
+    "streamSettings": { "network": "ws", "wsSettings": { "path": "/$urlpath" } }
+  }],
+  "outbounds": [{ "protocol": "freedom", "settings": {} }]
+}
+EOF
   fi
 
-  # 启动主服务
+  # 启动服务（限制内存使用）
+  echo "正在启动服务（低资源模式）..."
+  # 使用ulimit限制内存（单位：KB，根据实际情况调整）
+  ulimit -v 524288  # 限制最大使用512MB内存
   "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
-  "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
-  sleep 2  # 延长等待时间，确保进程启动
+  "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" >"$SUOHA_DIR/cloudflared.log" 2>&1 &
+  sleep 3
 
-  # 等待链接生成
+  # 检查Xray是否存活
+  if ! pgrep -f "$SUOHA_DIR/xray/xray" >/dev/null; then
+    echo "Xray启动失败！可能内存不足，日志：$SUOHA_DIR/xray.log"
+    exit 1
+  fi
+
+  # 获取隧道链接
+  echo "正在获取节点链接..."
   n=0
-  while :; do
+  while [ $n -lt 30 ]; do
+    argo_url="$(grep -oE 'https://[a-zA-Z0-9.-]+trycloudflare\.com' "$SUOHA_DIR/cloudflared.log" 2>/dev/null | tail -n1)"
+    [ -n "$argo_url" ] && break
     n=$((n+1))
-    argo_url="$(grep -oE 'https://[a-zA-Z0-9.-]+trycloudflare\.com' "$SUOHA_DIR/argo.log" 2>/dev/null | tail -n1)"
-    if [ $n -ge 30 ]; then
-      n=0
-      kill_proc_safe "$SUOHA_DIR/cloudflared"
-      kill_proc_safe "$SUOHA_DIR/xray/xray"
-      rm -f "$SUOHA_DIR/argo.log"
-      "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
-      "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
-      sleep 2
-    elif [ -z "$argo_url" ]; then
-      sleep 1
-    else
-      rm -f "$SUOHA_DIR/argo.log"
-      break
-    fi
+    sleep 1
   done
 
-  # 生成链接
+  if [ -z "$argo_url" ]; then
+    echo "获取链接失败，日志：$SUOHA_DIR/cloudflared.log"
+    exit 1
+  fi
+
+  # 输出节点信息
   argo_host="${argo_url#https://}"
   if [ "$protocol" = "1" ]; then
-    {
-      echo -e "VMess链接（含YouTube和ChatGPT分流）\n"
-      json_tls='{"add":"x.cf.090227.xyz","aid":"0","host":"'"$argo_host"'","id":"'"$uuid"'","net":"ws","path":"'"$urlpath"'","port":"2053","ps":"X-荷兰_TLS","tls":"tls","type":"none","v":"2"}'
-      echo "vmess://$(b64enc "$json_tls")"
-      echo -e "\nTLS端口: 2053/2083/2087/2096/8443\n"
-      json_nontls='{"add":"x.cf.090227.xyz","aid":"0","host":"'"$argo_host"'","id":"'"$uuid"'","net":"ws","path":"'"$urlpath"'","port":"2052","ps":"X-荷兰","tls":"","type":"none","v":"2"}'
-      echo "vmess://$(b64enc "$json_nontls")"
-      echo -e "\n非TLS端口: 2052/2082/2086/2095/8080/8880"
-    } > "$SUOHA_DIR/v2ray.txt"
+    echo -e "\nVMess节点（轻量化）："
+    echo "地址：$argo_host"
+    echo "端口：443"
+    echo "ID：$uuid"
+    echo "传输：ws，路径：/$urlpath"
   else
-    {
-      echo -e "VLESS链接（含YouTube和ChatGPT分流）\n"
-      echo "vless://${uuid}@x.cf.090227.xyz:2053?encryption=none&security=tls&type=ws&host=${argo_host}&path=${urlpath}#X-荷兰_TLS"
-      echo -e "\nTLS端口: 2053/2083/2087/2096/8443\n"
-      echo "vless://${uuid}@x.cf.090227.xyz:2052?encryption=none&security=none&type=ws&host=${argo_host}&path=${urlpath}#X-荷兰"
-      echo -e "\n非TLS端口: 2052/2082/2086/2095/8080/8880"
-    } > "$SUOHA_DIR/v2ray.txt"
+    echo -e "\nVLESS节点（轻量化）："
+    echo "地址：$argo_host"
+    echo "端口：443"
+    echo "ID：$uuid"
+    echo "传输：ws，路径：/$urlpath"
   fi
 
-  cat "$SUOHA_DIR/v2ray.txt"
-  echo -e "\n链接已保存至 $SUOHA_DIR/v2ray.txt"
+  echo -e "\n节点启动成功（低资源模式）"
 }
 
-# 启动服务
-start_service() {
-  read -r -p "选择协议 (1.vmess 2.vless, 默认1): " protocol
-  protocol=${protocol:-1}
-  [ "$protocol" != "1" ] && [ "$protocol" != "2" ] && die "请输入1或2"
-  
-  read -r -p "IP版本 (4/6, 默认4): " ips
-  ips=${ips:-4}
-  [ "$ips" != "4" ] && [ "$ips" != "6" ] && die "请输入4或6"
-
-  stop_service
-  _start_service_inner "$protocol" "$ips"
-  echo "停止服务: $0 stop"
+# 停止服务
+stop_node() {
+  pkill -f "$SUOHA_DIR/xray/xray" >/dev/null 2>&1 || true
+  pkill -f "$SUOHA_DIR/cloudflared" >/dev/null 2>&1 || true
+  echo "服务已停止"
 }
 
-# 停止服务（强制清理所有相关进程）
-stop_service() {
-  # 停止保活守护进程
-  kill_proc_safe "$0 keepalive_monitor"
-  # 停止主服务进程
-  kill_proc_safe "$SUOHA_DIR/cloudflared"
-  kill_proc_safe "$SUOHA_DIR/xray/xray"
-  # 清理残留的bash子进程（关键修复）
-  if [ "$IS_ALPINE" = "1" ]; then
-    kill -9 $(ps | grep -F "bash -c $0 keepalive_monitor" | grep -v grep | awk '{print $1}') >/dev/null 2>&1 || true
-  fi
-  echo "服务和保活进程已停止"
-}
-
-# 查看状态（精准显示）
+# 查看状态
 check_status() {
-  proc_exists "$SUOHA_DIR/cloudflared" && echo "cloudflared: 运行中" || echo "cloudflared: 已停止"
-  proc_exists "$SUOHA_DIR/xray/xray" && echo "xray: 运行中" || echo "xray: 已停止"
-  proc_exists "$0 keepalive_monitor" && echo "保活守护: 运行中" || echo "保活守护: 已停止"
-  
-  [ -f "$SUOHA_DIR/v2ray.txt" ] && echo -e "\n当前链接:\n$(cat "$SUOHA_DIR/v2ray.txt")" || echo -e "\n未找到链接"
+  pgrep -f "$SUOHA_DIR/xray/xray" >/dev/null && echo "Xray: 运行中" || echo "Xray: 已停止"
+  pgrep -f "$SUOHA_DIR/cloudflared" >/dev/null && echo "Cloudflared: 运行中" || echo "Cloudflared: 已停止"
 }
 
-# 清理文件
-cleanup() {
-  stop_service
-  rm -rf "$SUOHA_DIR"
-  echo "已清理所有文件"
-}
-
-# --- 保活核心功能（Alpine适配版） ---
-
-# 保活监控主函数
-keepalive_monitor() {
-  local SUOHA_DIR="$HOME/.suoha"
-  local XRAY_BIN="$SUOHA_DIR/xray/xray"
-  local XRAY_CONFIG="$SUOHA_DIR/xray/config.json"
-  local CLOUDFLARED_BIN="$SUOHA_DIR/cloudflared"
-  local KEEPALIVE_LOG="$SUOHA_DIR/proxy_keepalive.log"
-  
-  # 日志函数
-  log() {
-    touch "$KEEPALIVE_LOG"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$KEEPALIVE_LOG"
-  }
-  
-  # 前置检查
-  if [ ! -f "$XRAY_BIN" ] || [ ! -f "$XRAY_CONFIG" ] || [ ! -x "$CLOUDFLARED_BIN" ]; then
-    log "错误：主服务文件不完整，请先启动服务"
-    echo "错误：主服务文件不完整，请先启动服务" >&2
-    exit 1
-  fi
-  
-  # 提取端口（Alpine兼容的正则）
-  local port=$(grep -A 5 '"inbounds":' "$XRAY_CONFIG" | grep -oP '(?<="port": )\d+' | head -n1)
-  if [ -z "$port" ] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
-    log "错误：无法获取有效端口"
-    echo "错误：无法获取有效端口" >&2
-    exit 1
-  fi
-  
-  # 启动日志
-  log "保活服务启动成功 (PID=$$)"
-  log "监控目标：Xray和Cloudflared"
-  log "使用端口：$port"
-  
-  # 核心监控循环（每2秒检查一次）
-  while true; do
-    # 监控Xray
-    if ! proc_exists "$XRAY_BIN"; then
-      log "Xray已停止，重启中..."
-      kill_proc_safe "$XRAY_BIN"  # 清理残留
-      "$XRAY_BIN" run -config "$XRAY_CONFIG" >"$SUOHA_DIR/xray.log" 2>&1 &
-      sleep 1
-      proc_exists "$XRAY_BIN" && log "Xray重启成功" || log "Xray重启失败"
-    fi
-    
-    # 监控Cloudflared（当前已停止的核心修复点）
-    if ! proc_exists "$CLOUDFLARED_BIN"; then
-      log "Cloudflared已停止，重启中..."
-      kill_proc_safe "$CLOUDFLARED_BIN"  # 清理残留
-      "$CLOUDFLARED_BIN" tunnel --url "http://localhost:$port" --no-autoupdate --protocol http2 > "$SUOHA_DIR/cloudflared.log" 2>&1 &
-      sleep 1
-      proc_exists "$CLOUDFLARED_BIN" && log "Cloudflared重启成功" || log "Cloudflared重启失败"
-    fi
-    
-    sleep 2  # 缩短检查间隔，更快响应
-  done
-}
-
-# 保活服务管理
-manage_keepalive() {
-  local SUOHA_DIR="$HOME/.suoha"
-  
-  # 停止已有保活进程
-  if proc_exists "$0 keepalive_monitor"; then
-    kill_proc_safe "$0 keepalive_monitor"
-    echo "保活服务已停止"
-    return 0
-  fi
-  
-  # 检查主服务是否运行
-  if ! proc_exists "$SUOHA_DIR/xray/xray" || ! proc_exists "$SUOHA_DIR/cloudflared"; then
-    echo "错误：请先启动主服务（选项1），确保Xray和Cloudflared都运行" >&2
-    exit 1
-  fi
-  
-  # 启动保活服务（Alpine兼容方式）
-  echo "正在启动保活服务..."
-  nohup sh -c "$0 keepalive_monitor" > "$SUOHA_DIR/keepalive.log" 2>&1 &
-  
-  # 验证启动
-  sleep 2
-  if proc_exists "$0 keepalive_monitor"; then
-    echo "保活服务启动成功"
-    echo "保活日志：$SUOHA_DIR/proxy_keepalive.log"
-  else
-    echo "保活启动失败，请查看日志：$SUOHA_DIR/keepalive.log" >&2
-  fi
-}
-
-
-# --- 主菜单 ---
-echo "1. 启动服务（含YouTube和ChatGPT分流）"
+# 主菜单
+echo "1. 搭建节点（轻量化）"
 echo "2. 停止服务"
 echo "3. 查看状态"
-echo "4. 清理文件"
-echo "5. 切换保活服务（监控并重启进程）"
 echo "0. 退出"
 read -r -p "请选择(默认1): " mode
 mode=${mode:-1}
 
 case "$mode" in
-  1) start_service ;;
-  2) stop_service ;;
+  1) setup_node ;;
+  2) stop_node ;;
   3) check_status ;;
-  4) 
-    read -r -p "确定清理所有文件? (y/N) " confirm
-    [ "$confirm" = "y" ] && cleanup || echo "取消清理"
-    ;;
-  5) manage_keepalive ;;
-  0) echo "退出成功"; exit 0 ;;
+  0) echo "退出"; exit 0 ;;
   *) echo "无效选择"; exit 1 ;;
 esac
