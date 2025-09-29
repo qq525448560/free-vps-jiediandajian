@@ -55,6 +55,7 @@ PROXY_OUT_ID="8c1b9bea-cb51-43bb-a65c-0af31bbbf145"
 
 # --- 用户目录 ---
 SUOHA_DIR="$HOME/.suoha"
+KEEPALIVE_FLAG="$SUOHA_DIR/keepalive.running"  # 保活状态标志文件
 mkdir -p "$SUOHA_DIR" || die "无法创建目录 $SUOHA_DIR（请检查权限）"
 
 # --- 初始化 ---
@@ -227,8 +228,10 @@ start_service() {
 
 # 停止服务
 stop_service() {
-  # 停止保活守护进程 (通过grep脚本名和关键字'keepalive_monitor'来精确定位)
+  # 停止保活守护进程
   kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
+  # 删除保活标志
+  rm -f "$KEEPALIVE_FLAG"
   # 停止主服务进程
   kill_proc_safe "$SUOHA_DIR/cloudflared" "$IS_ALPINE"
   kill_proc_safe "$SUOHA_DIR/xray/xray" "$IS_ALPINE"
@@ -257,68 +260,67 @@ cleanup() {
   echo "已清理所有文件"
 }
 
-# --- 新增：保活功能 (优化版) ---
+# --- 保活功能 (优化版) ---
 
-# 保活监控函数 (直接作为函数运行)
+# 保活监控函数
 keepalive_monitor() {
-  local PROTOCOL="$1"
-  local IP_VERSION="$2"
-
   local XRAY_PROC="$SUOHA_DIR/xray/xray"
   local CLOUDFLARED_PROC="$SUOHA_DIR/cloudflared"
   local KEEPALIVE_LOG="$SUOHA_DIR/proxy_keepalive.log"
+  
+  # 从配置文件获取端口和IP版本
+  local port=$(grep -o '"port": [0-9]*' "$SUOHA_DIR/xray/config.json" | awk '{print $2}' | tr -d ',')
+  local ips=$(grep -oE 'edge-ip-version "4|6"' "$SUOHA_DIR/argo.log" 2>/dev/null | tail -n1 | awk '{print $2}' || echo "4")
 
   log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$KEEPALIVE_LOG"
   }
 
   log "保活守护进程启动 (PID=$$)"
-  log "配置: 协议=$PROTOCOL, IP版本=$IP_VERSION"
-
-  # 首次启动服务
-  log "首次启动代理服务..."
-  _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1 # 首次启动的输出重定向，避免日志混乱
+  log "开始监控Xray和Cloudflared进程..."
 
   # 循环检查
-  while true; do
+  while [ -f "$KEEPALIVE_FLAG" ]; do
     # 检查Xray
     if ! pgrep -f "$XRAY_PROC" >/dev/null; then
       log "Xray进程已退出，重启中..."
-      stop_service > /dev/null 2>&1
-      _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1
+      "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
     fi
     # 检查Cloudflared
     if ! pgrep -f "$CLOUDFLARED_PROC" >/dev/null; then
       log "Cloudflared进程已退出，重启中..."
-      stop_service > /dev/null 2>&1
-      _start_service_inner "$PROTOCOL" "$IP_VERSION" > /dev/null 2>&1
+      "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
     fi
-    sleep 5 # 增加检查间隔，减少CPU占用
+    sleep 5  # 每5秒检查一次
   done
+  
+  log "保活守护进程已停止"
 }
 
-# 启动保活服务 (新的菜单选项)
-start_keepalive_service() {
-  read -r -p "选择协议 (1.vmess 2.vless, 默认1): " protocol
-  protocol=${protocol:-1}
-  [ "$protocol" != "1" ] && [ "$protocol" != "2" ] && die "请输入1或2"
-  
-  read -r -p "IP版本 (4/6, 默认4): " ips
-  ips=${ips:-4}
-  [ "$ips" != "4" ] && [ "$ips" != "6" ] && die "请输入4或6"
-
-  # 停止任何现有服务
-  stop_service
-
-  echo "正在启动保活服务..."
-  # 直接在后台启动监控函数，不再创建临时脚本
-  nohup bash -c "$(declare -f log keepalive_monitor _start_service_inner stop_service kill_proc_safe die detect_os); keepalive_monitor '$protocol' '$ips'" > "$SUOHA_DIR/keepalive.log" 2>&1 &
-  
-  # 等待一小会儿，让服务有时间启动
-  sleep 3
-  check_status
-  echo -e "\n保活服务已在后台启动。日志文件: $SUOHA_DIR/keepalive.log"
-  echo "停止保活服务: $0 stop"
+# 切换保活功能（启动/关闭）
+toggle_keepalive() {
+  if [ -f "$KEEPALIVE_FLAG" ]; then
+    # 停止保活
+    rm -f "$KEEPALIVE_FLAG"
+    kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
+    echo "保活功能已停止"
+  else
+    # 检查是否已存在节点文件
+    if ! [ -f "$SUOHA_DIR/xray/config.json" ] || ! [ -f "$SUOHA_DIR/xray/xray" ] || ! [ -f "$SUOHA_DIR/cloudflared" ]; then
+      echo "未检测到节点文件，请先通过选项1搭建节点"
+      return 1
+    fi
+    
+    # 启动保活
+    touch "$KEEPALIVE_FLAG"
+    echo "正在启动保活功能..."
+    nohup bash -c "$(declare -f log keepalive_monitor kill_proc_safe); keepalive_monitor" > "$SUOHA_DIR/keepalive.log" 2>&1 &
+    
+    # 等待一小会儿，让服务有时间启动
+    sleep 2
+    check_status
+    echo "保活服务已在后台启动。日志文件: $SUOHA_DIR/keepalive.log"
+  fi
 }
 
 
@@ -327,7 +329,7 @@ echo "1. 启动服务（含YouTube和ChatGPT分流）"
 echo "2. 停止服务"
 echo "3. 查看状态"
 echo "4. 清理文件"
-echo "5. 启动保活服务（推荐）"
+echo "5. 切换保活功能（启动/关闭）"
 echo "0. 退出"
 read -r -p "请选择(默认1): " mode
 mode=${mode:-1}
@@ -347,7 +349,7 @@ case "$mode" in
     [ "$confirm" = "y" ] && cleanup || echo "取消清理"
     ;;
   5)
-    start_keepalive_service
+    toggle_keepalive
     ;;
   0)
     echo "退出成功"; exit 0;;
