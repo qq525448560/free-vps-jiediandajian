@@ -299,4 +299,66 @@ toggle_keepalive() {
       return 1
     fi
     touch "$KEEPALIVE_FLAG"
-    echo "正在启动
+    echo "正在启动保活功能，日志: $SUOHA_DIR/proxy_keepalive.log"
+    nohup bash -c "$0 keepalive_monitor" >/dev/null 2>&1 &
+    sleep 1
+    check_status
+  fi
+}
+
+# --- 保活服务（独立版，仅监控Xray和Cloudflared） ---
+keepalive_service() {
+  local XRAY_PROC="$SUOHA_DIR/xray/xray"
+  local CLOUDFLARED_PROC="$SUOHA_DIR/cloudflared"
+  local KEEPALIVE_LOG="$SUOHA_DIR/keepalive_service.log"
+
+  local port=$(grep -o '"port": [0-9]*' "$SUOHA_DIR/xray/config.json" | awk '{print $2}' | tr -d ',')
+  local ips="4"
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 保活服务启动 (PID=$$)" >> "$KEEPALIVE_LOG"
+
+  while true; do
+    if ! pgrep -f "$XRAY_PROC" >/dev/null; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到Xray已退出，正在重启..." >> "$KEEPALIVE_LOG"
+      "$SUOHA_DIR/xray/xray" run -config "$SUOHA_DIR/xray/config.json" >"$SUOHA_DIR/xray.log" 2>&1 &
+    fi
+
+    if ! pgrep -f "$CLOUDFLARED_PROC" >/dev/null; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到Cloudflared已退出，正在重启..." >> "$KEEPALIVE_LOG"
+      "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --edge-ip-version "$ips" --protocol http2 > "$SUOHA_DIR/argo.log" 2>&1 &
+    fi
+
+    sleep 5
+  done
+}
+
+# --- 主程序 ---
+mode="$1"
+
+if [ "$mode" = "keepalive_monitor" ]; then
+  keepalive_monitor
+  exit 0
+fi
+
+echo -e "\n=== 无root代理脚本 (保活版) ==="
+echo "1. 搭建节点"
+echo "2. 停止服务"
+echo "3. 查看状态"
+echo "4. 清理文件"
+echo "5. 保活服务（仅监控进程，独立版）"
+echo "6. 切换保活功能（守护进程版）"
+read -r -p "请选择: " mode
+
+case "$mode" in
+  1) start_service ;;
+  2) stop_service ;;
+  3) check_status ;;
+  4) cleanup ;;
+  5)
+    echo "启动独立保活服务（监控Xray和Cloudflared）..."
+    nohup bash -c "$(declare -f keepalive_service); keepalive_service" > "$SUOHA_DIR/keepalive_service.log" 2>&1 &
+    echo "保活服务已在后台运行，日志文件: $SUOHA_DIR/keepalive_service.log"
+    ;;
+  6) toggle_keepalive ;;
+  *) echo "无效选项" ;;
+esac
