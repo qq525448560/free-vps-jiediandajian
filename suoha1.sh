@@ -39,7 +39,7 @@ detect_os() {
   esac
 }
 
-# 检查进程是否存在
+# 检查进程是否存在（兼容Alpine）
 proc_exists() {
   local pat="$1"
   if [ "$IS_ALPINE" = "1" ]; then
@@ -49,7 +49,7 @@ proc_exists() {
   fi
 }
 
-# 强制终止进程
+# 强制终止进程（兼容Alpine）
 kill_proc_safe() {
   local pat="$1"
   if [ "$IS_ALPINE" = "1" ]; then
@@ -287,8 +287,8 @@ keepalive_monitor() {
     exit 1
   fi
   
-  # 从配置文件提取端口（只取inbounds中的端口）
-  local port=$(grep -A 5 '"inbounds":' "$XRAY_CONFIG" | grep -o '"port": [0-9]*' | head -n1 | awk '{print $2}' | tr -d ',')
+  # 从配置文件提取端口（严格匹配第一个inbounds的port）
+  local port=$(grep -A 5 '"inbounds":' "$XRAY_CONFIG" | grep -oP '(?<="port": )\d+' | head -n1)
   if [ -z "$port" ] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
     log "错误：无法获取有效端口，保活启动失败"
     echo "错误：无法获取有效端口，保活启动失败" >&2
