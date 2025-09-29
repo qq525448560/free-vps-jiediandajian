@@ -1,5 +1,5 @@
 #!/bin/bash
-# 无root权限版代理脚本 (已集成保活功能 - 优化版)
+# 无root权限版代理脚本 (修复保活功能版)
 
 set +e
 
@@ -227,7 +227,7 @@ start_service() {
 
 # 停止服务
 stop_service() {
-  # 停止保活守护进程 (通过grep脚本名和关键字'keepalive_monitor'来精确定位)
+  # 停止保活守护进程
   kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
   # 停止主服务进程
   kill_proc_safe "$SUOHA_DIR/cloudflared" "$IS_ALPINE"
@@ -257,96 +257,107 @@ cleanup() {
   echo "已清理所有文件"
 }
 
-# --- 保活功能 (仅监控重启，不搭建节点) ---
+# --- 保活功能 (修复版) ---
 
-# 保活监控函数 (仅监控已启动的服务，崩溃后重启)
+# 保活监控函数
 keepalive_monitor() {
+  # 显式定义目录，确保路径正确
+  local SUOHA_DIR="$HOME/.suoha"
   local XRAY_PROC="$SUOHA_DIR/xray/xray"
   local CLOUDFLARED_PROC="$SUOHA_DIR/cloudflared"
   local KEEPALIVE_LOG="$SUOHA_DIR/proxy_keepalive.log"
   local CONFIG_FILE="$SUOHA_DIR/xray/config.json"
+  local CLOUDFLARED_LOG="$SUOHA_DIR/cloudflared.log"
 
-  # 日志输出函数
+  # 日志函数
   log() {
+    # 确保日志文件存在
+    touch "$KEEPALIVE_LOG"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$KEEPALIVE_LOG"
   }
 
-  # 检查是否存在配置文件（确保服务已通过选项1启动）
+  # 检查配置文件是否存在
   if [ ! -f "$CONFIG_FILE" ]; then
-    log "错误：未找到代理配置文件，请先通过选项1启动服务"
-    echo "错误：未找到代理配置文件，请先通过选项1启动服务" >&2
+    log "错误：未找到配置文件，请先通过选项1启动服务"
+    echo "错误：未找到配置文件，请先通过选项1启动服务" >&2
     exit 1
   fi
 
-  # 提取端口配置（从现有配置文件中获取）
+  # 从配置文件获取端口
   local port=$(grep -o '"port": [0-9]*' "$CONFIG_FILE" | awk '{print $2}' | tr -d ',')
   if [ -z "$port" ]; then
-    log "错误：无法从配置文件中获取端口信息"
-    echo "错误：无法从配置文件中获取端口信息" >&2
+    log "错误：无法从配置文件获取端口信息"
+    echo "错误：无法从配置文件获取端口信息" >&2
     exit 1
   fi
 
   # 初始化日志
-  log "保活守护进程启动 (PID=$$) - 仅监控已存在的代理服务"
-  log "监控目标: Xray进程[$XRAY_PROC]、Cloudflared进程[$CLOUDFLARED_PROC]"
-  log "使用现有配置文件: $CONFIG_FILE (端口: $port)"
+  log "保活服务启动 (PID=$$)"
+  log "监控对象：Xray和Cloudflared进程"
+  log "使用端口：$port"
 
-  # 循环监控逻辑
+  # 监控循环
   while true; do
-    # 检查Xray进程状态
+    # 检查Xray
     if ! pgrep -f "$XRAY_PROC" >/dev/null; then
-      log "Xray进程已退出，尝试重启..."
-      # 基于已有的配置文件重启Xray（不重新生成配置）
+      log "Xray已停止，尝试重启..."
       if [ -f "$CONFIG_FILE" ]; then
         "$SUOHA_DIR/xray/xray" run -config "$CONFIG_FILE" >"$SUOHA_DIR/xray.log" 2>&1 &
-        log "Xray已重启"
+        log "Xray重启成功"
       else
-        log "错误：配置文件不存在，无法重启Xray"
+        log "配置文件丢失，无法重启Xray"
         exit 1
       fi
     fi
 
-    # 检查Cloudflared进程状态
+    # 检查Cloudflared
     if ! pgrep -f "$CLOUDFLARED_PROC" >/dev/null; then
-      log "Cloudflared进程已退出，尝试重启..."
+      log "Cloudflared已停止，尝试重启..."
       if [ -x "$CLOUDFLARED_PROC" ]; then
-        "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --protocol http2 > "$SUOHA_DIR/cloudflared.log" 2>&1 &
-        log "Cloudflared已重启"
+        "$SUOHA_DIR/cloudflared" tunnel --url "http://localhost:$port" --no-autoupdate --protocol http2 > "$CLOUDFLARED_LOG" 2>&1 &
+        log "Cloudflared重启成功"
       else
-        log "错误：cloudflared可执行文件不存在，无法重启"
+        log "Cloudflared文件丢失，无法重启"
         exit 1
       fi
     fi
 
-    sleep 5  # 每5秒检查一次
+    sleep 5
   done
 }
 
-# 保活服务管理（仅启动/停止保活进程，不涉及节点搭建）
+# 保活服务管理
 manage_keepalive() {
-  # 检查保活进程是否正在运行
+  local SUOHA_DIR="$HOME/.suoha"
+  
+  # 检查保活进程是否运行
   if pgrep -f "$0 keepalive_monitor" >/dev/null; then
-    # 停止保活进程
+    # 停止保活
     kill_proc_safe "$0 keepalive_monitor" "$IS_ALPINE"
     echo "保活服务已停止"
   else
-    # 检查主服务是否已启动（通过配置文件判断）
+    # 检查主服务是否已启动
     if [ ! -f "$SUOHA_DIR/xray/config.json" ] || ! pgrep -f "$SUOHA_DIR/xray/xray" >/dev/null; then
-      echo "错误：代理服务未启动，请先通过选项1启动服务" >&2
+      echo "错误：请先通过选项1启动代理服务" >&2
       exit 1
     fi
 
-    # 启动保活进程
+    # 启动保活
     echo "正在启动保活服务..."
-    nohup bash -c "$(declare -f log keepalive_monitor kill_proc_safe); keepalive_monitor" > "$SUOHA_DIR/keepalive.log" 2>&1 &
+    nohup bash -c "
+      $(declare -f kill_proc_safe)
+      $(declare -f log)
+      $(declare -f keepalive_monitor)
+      keepalive_monitor
+    " > "$SUOHA_DIR/keepalive.log" 2>&1 &
     
-    # 等待启动并检查状态
+    # 检查启动结果
     sleep 2
     if pgrep -f "$0 keepalive_monitor" >/dev/null; then
-      echo "保活服务已启动"
-      echo "保活日志: $SUOHA_DIR/proxy_keepalive.log"
+      echo "保活服务已成功启动"
+      echo "保活日志位置：$SUOHA_DIR/proxy_keepalive.log"
     else
-      echo "保活服务启动失败，请查看日志: $SUOHA_DIR/keepalive.log" >&2
+      echo "保活服务启动失败，请查看日志：$SUOHA_DIR/keepalive.log" >&2
     fi
   fi
 }
